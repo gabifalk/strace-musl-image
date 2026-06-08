@@ -1,0 +1,9 @@
+# Local spike notes — not part of the published repo
+FINDINGS.md
+
+# Local build artifacts / caches
+yocto-build/
+build/
+downloads/
+sstate-cache/
+*.log

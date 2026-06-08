@@ -1,0 +1,91 @@
+name: image
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 1,4"
+
+concurrency:
+  group: image
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/strace-musl-image
+  IMAGE_TAG: "6.0"
+  IMAGE_ARCH: amd64
+  SSTATE_DIR: /mnt/yocto/sstate-cache
+  DL_DIR: /mnt/yocto/downloads
+  WORKDIR: /mnt/yocto/work
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Free up runner disk
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false # keep swap
+
+      - name: Install Yocto host dependencies
+        run: |
+          sudo install -d -o "$USER" /mnt/yocto
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gawk wget git diffstat unzip texinfo gcc build-essential chrpath \
+            socat cpio python3 python3-pip python3-pexpect xz-utils debianutils \
+            iputils-ping python3-git python3-jinja2 python3-subunit zstd \
+            liblz4-tool file locales libacl1 libgomp1
+          sudo locale-gen en_US.UTF-8
+
+      - name: Allow unprivileged user namespaces
+        # bitbake requires user namespaces; Ubuntu 24.04 blocks them by default via
+        # AppArmor hardening. Lift the restriction for this runner.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Restore sstate (warm cache)
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.SSTATE_DIR }}
+          key: sstate-${{ github.run_id }}
+          restore-keys: sstate-
+
+      - name: Build rootfs
+        run: bash ci/build-image.sh
+
+      - name: Prune superseded sstate before caching
+        if: always()
+        run: python3 "$WORKDIR/oe-core/scripts/sstate-cache-management.py" --cache-dir="$SSTATE_DIR" --remove-duplicated --yes
+
+      - name: Save sstate
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.SSTATE_DIR }}
+          key: sstate-${{ github.run_id }}
+
+      - name: Build & push OCI image
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+          ID=$(bzip2 -dc "$WORKDIR/rootfs.tar.bz2" | \
+                 podman import --arch "$IMAGE_ARCH" - \
+                   "$IMAGE:$IMAGE_TAG-${{ github.run_id }}")
+          podman push "$IMAGE:$IMAGE_TAG-${{ github.run_id }}"
+          for t in "$IMAGE_TAG" "$IMAGE_TAG-$IMAGE_ARCH" latest; do
+            podman tag  "$IMAGE:$IMAGE_TAG-${{ github.run_id }}" "$IMAGE:$t"
+            podman push "$IMAGE:$t"
+          done
+          echo "Pushed $IMAGE:$IMAGE_TAG ($IMAGE_ARCH, $ID)" >> "$GITHUB_STEP_SUMMARY"
